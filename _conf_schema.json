@@ -3,18 +3,12 @@
     "description": "是否启用每日自定义节日播报",
     "type": "bool",
     "default": false,
-    "hint": "开启后会在 broadcast_time 向 broadcast_sessions 中的会话发送当天自定义节日"
+    "hint": "开启后会在 broadcast_time 查找当天节日，并按节日所属会话分别发送"
   },
   "broadcast_time": {
     "description": "每日播报时间",
     "type": "string",
     "default": "12:00",
     "hint": "24 小时制，格式为 HH:mm，例如 12:00"
-  },
-  "broadcast_sessions": {
-    "description": "每日播报目标会话",
-    "type": "list",
-    "default": [],
-    "hint": "填写 unified_msg_origin；可先通过 /datebook 测试播报确认当前会话可主动发送"
   }
 }

@@ -14,7 +14,7 @@ from .src.db import DatebookRepo, DBManager
 
 
 @register(
-    "astrbot_plugin_datebook", "lishining", "自定义节日日历与午间播报插件", "1.4.1"
+    "astrbot_plugin_datebook", "lishining", "自定义节日日历与午间播报插件", "1.4.2"
 )
 class DatebookPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
@@ -65,6 +65,7 @@ class DatebookPlugin(Star):
         """
         try:
             normalized_action = str(action or "today").strip().lower()
+            session_id = self._require_event_session_id(event)
             if normalized_action in {"create", "add", "添加", "创建"}:
                 safe_month, safe_day = self._date_or_today(month, day)
                 item = await self.repo.create_festival(
@@ -72,7 +73,7 @@ class DatebookPlugin(Star):
                     month=safe_month,
                     day=safe_day,
                     description=str(description or "").strip(),
-                    created_by=self._event_session_id(event),
+                    session_id=session_id,
                 )
                 return self._json({"ok": True, "action": "create", "festival": item})
 
@@ -91,13 +92,17 @@ class DatebookPlugin(Star):
                 if not updates:
                     raise ValueError("没有可更新的字段")
 
-                item = await self.repo.update_festival(int(festival_id), updates)
+                item = await self.repo.update_festival(
+                    int(festival_id), updates, session_id=session_id
+                )
                 if item is None:
                     return self._json({"ok": False, "error": "节日不存在"})
                 return self._json({"ok": True, "action": "update", "festival": item})
 
             if normalized_action in {"delete", "del", "remove", "删除"}:
-                deleted = await self.repo.delete_festival(int(festival_id))
+                deleted = await self.repo.delete_festival(
+                    int(festival_id), session_id=session_id
+                )
                 return self._json(
                     {"ok": deleted, "action": "delete", "festival_id": int(festival_id)}
                 )
@@ -109,6 +114,7 @@ class DatebookPlugin(Star):
                     day=safe_day,
                     keyword=str(name or "").strip(),
                     include_disabled=self._parse_optional_bool(enabled, False),
+                    session_id=session_id,
                 )
                 return self._json(
                     {
@@ -127,6 +133,7 @@ class DatebookPlugin(Star):
                     month=safe_month,
                     day=safe_day,
                     include_disabled=False,
+                    session_id=session_id,
                 )
                 return self._json(
                     {
@@ -153,8 +160,11 @@ class DatebookPlugin(Star):
             if action in {"帮助", "help"}:
                 yield event.plain_result(self._help_text())
                 return
+            session_id = self._require_event_session_id(event)
             if action in {"今天", "today"}:
-                festivals = await self.repo.list_today(date.today())
+                festivals = await self.repo.list_today(
+                    date.today(), session_id=session_id
+                )
                 yield event.plain_result(
                     self._format_daily_message(date.today(), festivals)
                 )
@@ -163,7 +173,11 @@ class DatebookPlugin(Star):
                 month = int(args[1]) if len(args) >= 2 else 0
                 day = int(args[2]) if len(args) >= 3 else 0
                 safe_month, safe_day = self._normalize_optional_date(month, day)
-                items = await self.repo.list_festivals(month=safe_month, day=safe_day)
+                items = await self.repo.list_festivals(
+                    month=safe_month,
+                    day=safe_day,
+                    session_id=session_id,
+                )
                 yield event.plain_result(self._format_festival_list(items))
                 return
             if action in {"添加", "add"}:
@@ -178,7 +192,7 @@ class DatebookPlugin(Star):
                     month=month,
                     day=day,
                     description=description,
-                    created_by=self._event_session_id(event),
+                    session_id=session_id,
                 )
                 yield event.plain_result(
                     f"已添加自定义节日：{item['id']}｜{item['month']:02d}-{item['day']:02d} {item['name']}"
@@ -188,7 +202,9 @@ class DatebookPlugin(Star):
                 if len(args) < 2:
                     yield event.plain_result("用法：/datebook 删除 节日ID")
                     return
-                deleted = await self.repo.delete_festival(int(args[1]))
+                deleted = await self.repo.delete_festival(
+                    int(args[1]), session_id=session_id
+                )
                 yield event.plain_result("已删除" if deleted else "节日不存在")
                 return
             if action in {"启用", "enable", "停用", "disable"}:
@@ -198,14 +214,14 @@ class DatebookPlugin(Star):
                     )
                     return
                 item = await self.repo.update_festival(
-                    int(args[1]), {"enabled": action in {"启用", "enable"}}
+                    int(args[1]),
+                    {"enabled": action in {"启用", "enable"}},
+                    session_id=session_id,
                 )
                 yield event.plain_result("已更新" if item else "节日不存在")
                 return
             if action in {"测试播报", "test"}:
-                await self._send_daily_message_to_session(
-                    self._event_session_id(event), date.today()
-                )
+                await self._send_daily_message_to_session(session_id, date.today())
                 yield event.plain_result("已发送今日节日播报测试消息")
                 return
 
@@ -237,18 +253,27 @@ class DatebookPlugin(Star):
         if not self._daily_broadcast_enabled():
             return
         today = date.today()
-        sessions = self._broadcast_sessions()
-        for session_id in sessions:
+        festivals = await self.repo.list_today_all_sessions(today)
+        if not festivals:
+            return
+        festivals_by_session = self._group_festivals_by_session(festivals)
+        for session_id, session_festivals in festivals_by_session.items():
             session = await self.repo.set_session_enabled(session_id, True)
             if str(session.get("last_sent_date") or "") == today.isoformat():
                 continue
-            await self._send_daily_message_to_session(session_id, today)
+            await self._send_daily_message_to_session(
+                session_id, today, session_festivals
+            )
             await self.repo.mark_session_sent(session_id, today.isoformat())
 
     async def _send_daily_message_to_session(
-        self, session_id: str, target_date: date
+        self,
+        session_id: str,
+        target_date: date,
+        festivals: list[dict[str, Any]] | None = None,
     ) -> None:
-        festivals = await self.repo.list_today(target_date)
+        if festivals is None:
+            festivals = await self.repo.list_today(target_date, session_id=session_id)
         chain = MessageChain().message(
             self._format_daily_message(target_date, festivals)
         )
@@ -337,17 +362,6 @@ class DatebookPlugin(Star):
             self.config.get("enable_daily_broadcast", False), False
         )
 
-    def _broadcast_sessions(self) -> list[str]:
-        raw_sessions = self.config.get("broadcast_sessions", []) or []
-        if isinstance(raw_sessions, str):
-            raw_sessions = raw_sessions.replace("，", ",").split(",")
-        sessions: list[str] = []
-        for item in raw_sessions:
-            normalized = str(item or "").strip()
-            if normalized and normalized not in sessions:
-                sessions.append(normalized)
-        return sessions
-
     def _broadcast_time(self) -> time:
         raw_time = str(self.config.get("broadcast_time", "12:00") or "12:00").strip()
         try:
@@ -355,6 +369,18 @@ class DatebookPlugin(Star):
             return time(hour=int(hour_text), minute=int(minute_text))
         except Exception:
             return time(hour=12, minute=0)
+
+    @staticmethod
+    def _group_festivals_by_session(
+        festivals: list[dict[str, Any]],
+    ) -> dict[str, list[dict[str, Any]]]:
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for festival in festivals:
+            session_id = str(festival.get("session_id") or "").strip()
+            if not session_id:
+                continue
+            grouped.setdefault(session_id, []).append(festival)
+        return grouped
 
     @staticmethod
     def _require_name(name: str) -> str:
@@ -368,6 +394,13 @@ class DatebookPlugin(Star):
     @staticmethod
     def _event_session_id(event: AstrMessageEvent) -> str:
         return str(getattr(event, "unified_msg_origin", "") or "").strip()
+
+    @staticmethod
+    def _require_event_session_id(event: AstrMessageEvent) -> str:
+        session_id = DatebookPlugin._event_session_id(event)
+        if not session_id:
+            raise ValueError("无法获取当前会话 ID")
+        return session_id
 
     @staticmethod
     def _strip_command(text: str) -> str:
@@ -420,7 +453,7 @@ class DatebookPlugin(Star):
                 "/datebook 启用 节日ID",
                 "/datebook 停用 节日ID",
                 "/datebook 测试播报",
-                "每日播报请在插件配置中开启，并填写 broadcast_sessions。",
+                "每日播报请在插件配置中开启。",
             ]
         )
 

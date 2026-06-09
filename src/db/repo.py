@@ -21,7 +21,7 @@ class DatebookRepo:
         month: int,
         day: int,
         description: str,
-        created_by: str,
+        session_id: str,
     ) -> dict[str, Any]:
         await self.db.init_db()
         return await asyncio.to_thread(
@@ -30,7 +30,7 @@ class DatebookRepo:
             month,
             day,
             description,
-            created_by,
+            session_id,
         )
 
     def _create_festival_sync(
@@ -39,22 +39,32 @@ class DatebookRepo:
         month: int,
         day: int,
         description: str,
-        created_by: str,
+        session_id: str,
     ) -> dict[str, Any]:
         now = self._now()
+        normalized_session = str(session_id or "").strip()
         with self.db._connect() as conn:
             cursor = conn.execute(
                 """
                 INSERT INTO datebook_festival
-                    (name, month, day, description, enabled, created_by, created_at, updated_at)
-                VALUES (?, ?, ?, ?, 1, ?, ?, ?)
+                    (name, month, day, description, enabled, session_id, created_by, created_at, updated_at)
+                VALUES (?, ?, ?, ?, 1, ?, ?, ?, ?)
                 """,
-                (name, int(month), int(day), description, created_by, now, now),
+                (
+                    name,
+                    int(month),
+                    int(day),
+                    description,
+                    normalized_session,
+                    normalized_session,
+                    now,
+                    now,
+                ),
             )
             conn.commit()
             row = conn.execute(
                 """
-                SELECT id, name, month, day, description, enabled, created_by, created_at, updated_at
+                SELECT id, name, month, day, description, enabled, session_id, created_by, created_at, updated_at
                 FROM datebook_festival
                 WHERE id = ?
                 """,
@@ -63,46 +73,59 @@ class DatebookRepo:
         return self._festival_row_to_dict(row)
 
     async def update_festival(
-        self, festival_id: int, updates: dict[str, Any]
+        self, festival_id: int, updates: dict[str, Any], session_id: str = ""
     ) -> dict[str, Any] | None:
         await self.db.init_db()
-        return await asyncio.to_thread(self._update_festival_sync, festival_id, updates)
+        return await asyncio.to_thread(
+            self._update_festival_sync, festival_id, updates, session_id
+        )
 
     def _update_festival_sync(
-        self, festival_id: int, updates: dict[str, Any]
+        self, festival_id: int, updates: dict[str, Any], session_id: str = ""
     ) -> dict[str, Any] | None:
         allowed = {"name", "month", "day", "description", "enabled"}
         fields = {key: value for key, value in updates.items() if key in allowed}
         if not fields:
-            return self.get_festival_sync(festival_id)
+            return self.get_festival_sync(festival_id, session_id)
 
         assignments = [f"{key} = ?" for key in fields]
         values: list[Any] = list(fields.values())
         assignments.append("updated_at = ?")
         values.append(self._now())
         values.append(int(festival_id))
+        normalized_session = str(session_id or "").strip()
 
+        session_clause = ""
+        if normalized_session:
+            session_clause = "AND session_id = ?"
+            values.append(normalized_session)
         with self.db._connect() as conn:
             conn.execute(
                 f"""
                 UPDATE datebook_festival
                 SET {", ".join(assignments)}
-                WHERE id = ?
+                WHERE id = ? {session_clause}
                 """,
                 values,
             )
             conn.commit()
-        return self.get_festival_sync(festival_id)
+        return self.get_festival_sync(festival_id, session_id)
 
-    async def delete_festival(self, festival_id: int) -> bool:
+    async def delete_festival(self, festival_id: int, session_id: str = "") -> bool:
         await self.db.init_db()
-        return await asyncio.to_thread(self._delete_festival_sync, festival_id)
+        return await asyncio.to_thread(
+            self._delete_festival_sync, festival_id, session_id
+        )
 
-    def _delete_festival_sync(self, festival_id: int) -> bool:
+    def _delete_festival_sync(self, festival_id: int, session_id: str = "") -> bool:
+        normalized_session = str(session_id or "").strip()
+        sql = "DELETE FROM datebook_festival WHERE id = ?"
+        values: list[Any] = [int(festival_id)]
+        if normalized_session:
+            sql += " AND session_id = ?"
+            values.append(normalized_session)
         with self.db._connect() as conn:
-            cursor = conn.execute(
-                "DELETE FROM datebook_festival WHERE id = ?", (int(festival_id),)
-            )
+            cursor = conn.execute(sql, values)
             conn.commit()
         return cursor.rowcount > 0
 
@@ -113,6 +136,7 @@ class DatebookRepo:
         day: int | None = None,
         keyword: str = "",
         include_disabled: bool = False,
+        session_id: str = "",
     ) -> list[dict[str, Any]]:
         await self.db.init_db()
         return await asyncio.to_thread(
@@ -121,9 +145,20 @@ class DatebookRepo:
             day,
             keyword,
             include_disabled,
+            session_id,
         )
 
-    async def list_today(self, target_date: date) -> list[dict[str, Any]]:
+    async def list_today(
+        self, target_date: date, session_id: str = ""
+    ) -> list[dict[str, Any]]:
+        return await self.list_festivals(
+            month=target_date.month,
+            day=target_date.day,
+            include_disabled=False,
+            session_id=session_id,
+        )
+
+    async def list_today_all_sessions(self, target_date: date) -> list[dict[str, Any]]:
         return await self.list_festivals(
             month=target_date.month,
             day=target_date.day,
@@ -136,6 +171,7 @@ class DatebookRepo:
         day: int | None,
         keyword: str,
         include_disabled: bool,
+        session_id: str,
     ) -> list[dict[str, Any]]:
         clauses: list[str] = []
         values: list[Any] = []
@@ -152,15 +188,19 @@ class DatebookRepo:
             clauses.append("(name LIKE ? OR description LIKE ?)")
             like_value = f"%{normalized_keyword}%"
             values.extend([like_value, like_value])
+        normalized_session = str(session_id or "").strip()
+        if normalized_session:
+            clauses.append("session_id = ?")
+            values.append(normalized_session)
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         with self.db._connect() as conn:
             rows = conn.execute(
                 f"""
-                SELECT id, name, month, day, description, enabled, created_by, created_at, updated_at
+                SELECT id, name, month, day, description, enabled, session_id, created_by, created_at, updated_at
                 FROM datebook_festival
                 {where_sql}
-                ORDER BY month, day, id
+                ORDER BY session_id, month, day, id
                 """,
                 values,
             ).fetchall()
@@ -235,16 +275,21 @@ class DatebookRepo:
             )
             conn.commit()
 
-    def get_festival_sync(self, festival_id: int) -> dict[str, Any] | None:
+    def get_festival_sync(
+        self, festival_id: int, session_id: str = ""
+    ) -> dict[str, Any] | None:
+        normalized_session = str(session_id or "").strip()
+        sql = """
+            SELECT id, name, month, day, description, enabled, session_id, created_by, created_at, updated_at
+            FROM datebook_festival
+            WHERE id = ?
+        """
+        values: list[Any] = [int(festival_id)]
+        if normalized_session:
+            sql += " AND session_id = ?"
+            values.append(normalized_session)
         with self.db._connect() as conn:
-            row = conn.execute(
-                """
-                SELECT id, name, month, day, description, enabled, created_by, created_at, updated_at
-                FROM datebook_festival
-                WHERE id = ?
-                """,
-                (int(festival_id),),
-            ).fetchone()
+            row = conn.execute(sql, values).fetchone()
         return self._festival_row_to_dict(row) if row else None
 
     @staticmethod
@@ -256,6 +301,7 @@ class DatebookRepo:
             "day": int(row["day"]),
             "description": str(row["description"] or ""),
             "enabled": bool(row["enabled"]),
+            "session_id": str(row["session_id"] or ""),
             "created_by": str(row["created_by"] or ""),
             "created_at": str(row["created_at"]),
             "updated_at": str(row["updated_at"]),

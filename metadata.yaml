@@ -1,6 +1,6 @@
 name: astrbot_plugin_datebook
 display_name: 自定义节日日历
-desc: 让 AI 通过综合工具创建和管理自定义节日，并按配置每天播报当天节日。
-version: v1.4.1
+desc: 让 AI 按会话创建和管理自定义节日，并按配置向对应会话播报当天节日。
+version: v1.4.2
 author: lishining
 repo: https://github.com/lishining/astrbot_plugin_datebook
