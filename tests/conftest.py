@@ -64,6 +64,7 @@ def install_astrbot_stubs() -> None:
 
     astrbot = types.ModuleType("astrbot")
     api = types.ModuleType("astrbot.api")
+    api.AstrBotConfig = dict
     api.logger = logging.getLogger("astrbot-plugin-datebook-tests")
 
     event_module = types.ModuleType("astrbot.api.event")

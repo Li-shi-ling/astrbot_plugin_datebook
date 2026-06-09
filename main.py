@@ -6,7 +6,7 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any
 
-from astrbot.api import logger
+from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, StarTools, register
 
@@ -14,11 +14,12 @@ from .src.db import DatebookRepo, DBManager
 
 
 @register(
-    "astrbot_plugin_datebook", "lishining", "自定义节日日历与午间播报插件", "1.4.0"
+    "astrbot_plugin_datebook", "lishining", "自定义节日日历与午间播报插件", "1.4.1"
 )
 class DatebookPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: AstrBotConfig | dict | None = None):
         super().__init__(context)
+        self.config = config or {}
         self._data_dir = Path(StarTools.get_data_dir())
         self.db_file = self._data_dir / "datebook.db"
         self.db = DBManager(self.db_file)
@@ -28,7 +29,8 @@ class DatebookPlugin(Star):
 
     async def initialize(self) -> None:
         await self.repo.init()
-        await self.start_broadcast_task()
+        if self._daily_broadcast_enabled():
+            await self.start_broadcast_task()
 
     async def terminate(self) -> None:
         self.broadcast_running = False
@@ -39,126 +41,107 @@ class DatebookPlugin(Star):
             except asyncio.CancelledError:
                 pass
 
-    @filter.llm_tool(name="datebook_create_festival")
-    async def datebook_create_festival(
+    @filter.llm_tool(name="datebook_manage")
+    async def datebook_manage(
         self,
         event: AstrMessageEvent,
-        name: str,
-        month: int,
-        day: int,
-        description: str = "",
-    ) -> str:
-        """Create a custom festival in the datebook.
-        Args:
-            name(string): Festival name.
-            month(int): Month number, 1 to 12.
-            day(int): Day number in the month.
-            description(string, optional): Optional festival description.
-        """
-        try:
-            safe_month, safe_day = self._validate_month_day(month, day)
-            item = await self.repo.create_festival(
-                name=self._require_name(name),
-                month=safe_month,
-                day=safe_day,
-                description=str(description or "").strip(),
-                created_by=self._event_session_id(event),
-            )
-            return self._json({"ok": True, "festival": item})
-        except Exception as exc:
-            return self._json({"ok": False, "error": str(exc)})
-
-    @filter.llm_tool(name="datebook_update_festival")
-    async def datebook_update_festival(
-        self,
-        event: AstrMessageEvent,
-        festival_id: int,
+        action: str = "today",
+        festival_id: int = 0,
         name: str = "",
         month: int = 0,
         day: int = 0,
         description: str = "",
         enabled: str = "",
     ) -> str:
-        """Update a custom festival by id.
+        """Manage custom festivals. Date arguments default to today when omitted.
         Args:
-            festival_id(int): Festival id to update.
-            name(string, optional): New festival name. Empty means unchanged.
-            month(int, optional): New month. Use with day. Zero means unchanged.
-            day(int, optional): New day. Use with month. Zero means unchanged.
-            description(string, optional): New description. Empty means unchanged.
-            enabled(string, optional): true/false to enable or disable. Empty means unchanged.
+            action(string, optional): Operation name: create, update, delete, list, today.
+            festival_id(int, optional): Festival id for update or delete.
+            name(string, optional): Festival name for create or update.
+            month(int, optional): Month number. Defaults to current month for create/list/today.
+            day(int, optional): Day number. Defaults to current day for create/list/today.
+            description(string, optional): Festival description for create or update.
+            enabled(string, optional): true/false for update. Empty means unchanged.
         """
         try:
-            updates: dict[str, Any] = {}
-            if str(name or "").strip():
-                updates["name"] = self._require_name(name)
-            if month or day:
-                safe_month, safe_day = self._validate_month_day(month, day)
-                updates["month"] = safe_month
-                updates["day"] = safe_day
-            if str(description or "").strip():
-                updates["description"] = str(description or "").strip()
-            if str(enabled or "").strip():
-                updates["enabled"] = self._parse_bool(enabled)
-            if not updates:
-                raise ValueError("没有可更新的字段")
+            normalized_action = str(action or "today").strip().lower()
+            if normalized_action in {"create", "add", "添加", "创建"}:
+                safe_month, safe_day = self._date_or_today(month, day)
+                item = await self.repo.create_festival(
+                    name=self._require_name(name),
+                    month=safe_month,
+                    day=safe_day,
+                    description=str(description or "").strip(),
+                    created_by=self._event_session_id(event),
+                )
+                return self._json({"ok": True, "action": "create", "festival": item})
 
-            item = await self.repo.update_festival(int(festival_id), updates)
-            if item is None:
-                return self._json({"ok": False, "error": "节日不存在"})
-            return self._json({"ok": True, "festival": item})
+            if normalized_action in {"update", "edit", "修改", "更新"}:
+                updates: dict[str, Any] = {}
+                if str(name or "").strip():
+                    updates["name"] = self._require_name(name)
+                if month or day:
+                    safe_month, safe_day = self._date_or_today(month, day)
+                    updates["month"] = safe_month
+                    updates["day"] = safe_day
+                if str(description or "").strip():
+                    updates["description"] = str(description or "").strip()
+                if str(enabled or "").strip():
+                    updates["enabled"] = self._parse_bool(enabled)
+                if not updates:
+                    raise ValueError("没有可更新的字段")
+
+                item = await self.repo.update_festival(int(festival_id), updates)
+                if item is None:
+                    return self._json({"ok": False, "error": "节日不存在"})
+                return self._json({"ok": True, "action": "update", "festival": item})
+
+            if normalized_action in {"delete", "del", "remove", "删除"}:
+                deleted = await self.repo.delete_festival(int(festival_id))
+                return self._json(
+                    {"ok": deleted, "action": "delete", "festival_id": int(festival_id)}
+                )
+
+            if normalized_action in {"list", "search", "query", "列表", "查询"}:
+                safe_month, safe_day = self._date_or_today(month, day)
+                items = await self.repo.list_festivals(
+                    month=safe_month,
+                    day=safe_day,
+                    keyword=str(name or "").strip(),
+                    include_disabled=self._parse_optional_bool(enabled, False),
+                )
+                return self._json(
+                    {
+                        "ok": True,
+                        "action": "list",
+                        "month": safe_month,
+                        "day": safe_day,
+                        "count": len(items),
+                        "festivals": items,
+                    }
+                )
+
+            if normalized_action in {"today", "当天", "今天"}:
+                safe_month, safe_day = self._date_or_today(month, day)
+                items = await self.repo.list_festivals(
+                    month=safe_month,
+                    day=safe_day,
+                    include_disabled=False,
+                )
+                return self._json(
+                    {
+                        "ok": True,
+                        "action": "today",
+                        "month": safe_month,
+                        "day": safe_day,
+                        "count": len(items),
+                        "festivals": items,
+                    }
+                )
+
+            raise ValueError("action 只能是 create、update、delete、list 或 today")
         except Exception as exc:
             return self._json({"ok": False, "error": str(exc)})
-
-    @filter.llm_tool(name="datebook_delete_festival")
-    async def datebook_delete_festival(
-        self, event: AstrMessageEvent, festival_id: int
-    ) -> str:
-        """Delete a custom festival by id.
-        Args:
-            festival_id(int): Festival id to delete.
-        """
-        deleted = await self.repo.delete_festival(int(festival_id))
-        return self._json({"ok": deleted, "festival_id": int(festival_id)})
-
-    @filter.llm_tool(name="datebook_list_festivals")
-    async def datebook_list_festivals(
-        self,
-        event: AstrMessageEvent,
-        month: int = 0,
-        day: int = 0,
-        keyword: str = "",
-        include_disabled: bool = False,
-    ) -> str:
-        """List custom festivals.
-        Args:
-            month(int, optional): Filter month. Zero means all months.
-            day(int, optional): Filter day. Zero means all days.
-            keyword(string, optional): Filter by name or description.
-            include_disabled(bool, optional): Include disabled festivals.
-        """
-        safe_month, safe_day = self._normalize_optional_date(month, day)
-        items = await self.repo.list_festivals(
-            month=safe_month,
-            day=safe_day,
-            keyword=str(keyword or "").strip(),
-            include_disabled=bool(include_disabled),
-        )
-        return self._json({"ok": True, "count": len(items), "festivals": items})
-
-    @filter.llm_tool(name="datebook_set_daily_broadcast")
-    async def datebook_set_daily_broadcast(
-        self, event: AstrMessageEvent, enabled: bool = True
-    ) -> str:
-        """Enable or disable daily noon festival broadcast for the current session.
-        Args:
-            enabled(bool, optional): true to enable daily broadcast, false to disable it.
-        """
-        session_id = self._event_session_id(event)
-        if not session_id:
-            return self._json({"ok": False, "error": "无法获取当前会话"})
-        item = await self.repo.set_session_enabled(session_id, bool(enabled))
-        return self._json({"ok": True, "session": item})
 
     @filter.command("datebook")
     async def datebook_command(self, event: AstrMessageEvent):
@@ -219,16 +202,6 @@ class DatebookPlugin(Star):
                 )
                 yield event.plain_result("已更新" if item else "节日不存在")
                 return
-            if action in {"订阅", "subscribe"}:
-                await self.repo.set_session_enabled(self._event_session_id(event), True)
-                yield event.plain_result("已开启本会话每日 12:00 自定义节日播报")
-                return
-            if action in {"取消订阅", "unsubscribe"}:
-                await self.repo.set_session_enabled(
-                    self._event_session_id(event), False
-                )
-                yield event.plain_result("已关闭本会话每日 12:00 自定义节日播报")
-                return
             if action in {"测试播报", "test"}:
                 await self._send_daily_message_to_session(
                     self._event_session_id(event), date.today()
@@ -250,7 +223,7 @@ class DatebookPlugin(Star):
     async def _periodic_noon_broadcast(self) -> None:
         while self.broadcast_running:
             try:
-                await asyncio.sleep(self._seconds_until_next_noon())
+                await asyncio.sleep(self._seconds_until_next_broadcast())
                 if not self.broadcast_running:
                     break
                 await self._broadcast_today()
@@ -261,10 +234,12 @@ class DatebookPlugin(Star):
                 await asyncio.sleep(60)
 
     async def _broadcast_today(self) -> None:
+        if not self._daily_broadcast_enabled():
+            return
         today = date.today()
-        sessions = await self.repo.list_enabled_sessions()
-        for session in sessions:
-            session_id = str(session["session_id"])
+        sessions = self._broadcast_sessions()
+        for session_id in sessions:
+            session = await self.repo.set_session_enabled(session_id, True)
             if str(session.get("last_sent_date") or "") == today.isoformat():
                 continue
             await self._send_daily_message_to_session(session_id, today)
@@ -293,13 +268,13 @@ class DatebookPlugin(Star):
             return
         await self.context.send_message(session_id, chain)
 
-    @staticmethod
-    def _seconds_until_next_noon(now: datetime | None = None) -> float:
+    def _seconds_until_next_broadcast(self, now: datetime | None = None) -> float:
         now = now or datetime.now()
-        noon = datetime.combine(now.date(), time(hour=12, minute=0))
-        if now > noon:
-            noon += timedelta(days=1)
-        return max(0.0, (noon - now).total_seconds())
+        broadcast_time = self._broadcast_time()
+        target = datetime.combine(now.date(), broadcast_time)
+        if now > target:
+            target += timedelta(days=1)
+        return max(0.0, (target - now).total_seconds())
 
     @staticmethod
     def _validate_month_day(month: int | str, day: int | str) -> tuple[int, int]:
@@ -328,6 +303,19 @@ class DatebookPlugin(Star):
         raise ValueError("按日期筛选时不能只提供日期，请同时提供月份")
 
     @staticmethod
+    def _date_or_today(month: int | str, day: int | str) -> tuple[int, int]:
+        safe_month = int(month or 0)
+        safe_day = int(day or 0)
+        if safe_month == 0 and safe_day == 0:
+            today = date.today()
+            return today.month, today.day
+        if safe_month == 0 or safe_day == 0:
+            today = date.today()
+            safe_month = safe_month or today.month
+            safe_day = safe_day or today.day
+        return DatebookPlugin._validate_month_day(safe_month, safe_day)
+
+    @staticmethod
     def _parse_bool(value: Any) -> bool:
         if isinstance(value, bool):
             return value
@@ -337,6 +325,36 @@ class DatebookPlugin(Star):
         if normalized in {"false", "0", "no", "n", "停用", "关闭"}:
             return False
         raise ValueError("enabled 只能是 true 或 false")
+
+    @staticmethod
+    def _parse_optional_bool(value: Any, default: bool) -> bool:
+        if str(value or "").strip() == "":
+            return default
+        return DatebookPlugin._parse_bool(value)
+
+    def _daily_broadcast_enabled(self) -> bool:
+        return self._parse_optional_bool(
+            self.config.get("enable_daily_broadcast", False), False
+        )
+
+    def _broadcast_sessions(self) -> list[str]:
+        raw_sessions = self.config.get("broadcast_sessions", []) or []
+        if isinstance(raw_sessions, str):
+            raw_sessions = raw_sessions.replace("，", ",").split(",")
+        sessions: list[str] = []
+        for item in raw_sessions:
+            normalized = str(item or "").strip()
+            if normalized and normalized not in sessions:
+                sessions.append(normalized)
+        return sessions
+
+    def _broadcast_time(self) -> time:
+        raw_time = str(self.config.get("broadcast_time", "12:00") or "12:00").strip()
+        try:
+            hour_text, minute_text = raw_time.split(":", 1)
+            return time(hour=int(hour_text), minute=int(minute_text))
+        except Exception:
+            return time(hour=12, minute=0)
 
     @staticmethod
     def _require_name(name: str) -> str:
@@ -401,9 +419,8 @@ class DatebookPlugin(Star):
                 "/datebook 删除 节日ID",
                 "/datebook 启用 节日ID",
                 "/datebook 停用 节日ID",
-                "/datebook 订阅",
-                "/datebook 取消订阅",
                 "/datebook 测试播报",
+                "每日播报请在插件配置中开启，并填写 broadcast_sessions。",
             ]
         )
 
